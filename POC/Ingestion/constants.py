@@ -90,3 +90,24 @@ CORPUS_PARTS = {
     "raw":          ["raw_dataset/**"],
     "all":          None,
 }
+
+# --- Vector index (db_populate.py) ------------------------------------------
+QDRANT_PATH = os.path.join(LOCAL_PROCESSED_DIR, "qdrant")   # embedded mode
+QDRANT_COLLECTION = "research_query"
+QDRANT_URL_ENV = "QDRANT_URL"           # set to run against a server instead
+
+EMBED_MODEL = "BAAI/bge-m3"
+EMBED_DIM = 1024
+DENSE_VECTOR = "dense"
+SPARSE_VECTOR = "sparse"
+
+# Chunking. 2048 tokens covers 99.2% of table rows whole (see retrieval_eval.ipynb),
+# so only text sections are split; asset rows are indexed as they are.
+CHUNK_TOKENS = 500
+CHUNK_OVERLAP_TOKENS = 75
+CHARS_PER_TOKEN = 4                     # consistent with the sizing in the notebooks
+MAX_ROW_TOKENS = 2048                   # hard ceiling before truncation
+
+EMBED_BATCH_SIZE = 16
+UPSERT_BATCH_SIZE = 256
+INDEXED_DOCS_JSON = "indexed_docs.json"

@@ -11,6 +11,9 @@ dependencies = [
     "pymupdf>=1.28.2",
     "pymupdf-layout>=1.28.2",
     "python-dotenv>=1.2.3",
+    "qdrant-client>=1.19.0",
+    "fastembed>=0.8.0",
+    "flagembedding>=1.4.2",
 ]
 
 [dependency-groups]

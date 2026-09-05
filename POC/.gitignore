@@ -16,3 +16,6 @@ logs/
 # Data: 715MB HF snapshot + 3GB of parse output, all reproducible from
 # ingestion.py and data_process.py. Never commit it.
 Ingestion/data/
+
+# Embedded Qdrant lives under Ingestion/data/, already ignored — noted here
+# because the collection is rebuildable from db_populate.py.
