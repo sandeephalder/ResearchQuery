@@ -39,6 +39,8 @@ from constants import (CHARS_PER_TOKEN, CHUNK_OVERLAP_TOKENS, CHUNK_TOKENS, DENS
                        QDRANT_COLLECTION, QDRANT_PATH, QDRANT_URL_ENV, SPARSE_VECTOR,
                        UPSERT_BATCH_SIZE)
 
+ROW_KINDS = ("text", "figure", "table")
+
 PLACEHOLDER_RE = re.compile(r"!\[([^\]]+)\]\(([^)]+)\)")
 # Fixed namespace so point ids are stable across runs: re-indexing a document
 # overwrites its points instead of creating a second copy.
@@ -87,8 +89,9 @@ def chunk_text(text, target_chars, overlap_chars):
     return chunks
 
 
-def rows_for_document(document, target_chars, overlap_chars):
-    """Every indexable row for one parsed document."""
+def rows_for_document(document, target_chars, overlap_chars, kinds=ROW_KINDS):
+    """Every indexable row for one parsed document, limited to `kinds`."""
+    kinds = set(kinds)
     rows = []
     doc_id, title = document["id"], document.get("title", "")
 
@@ -97,7 +100,8 @@ def rows_for_document(document, target_chars, overlap_chars):
         text = section["text"]
         assets = {**section["images"], **section["tables"]}
 
-        for ordinal, (start, end) in enumerate(chunk_text(text, target_chars, overlap_chars)):
+        for ordinal, (start, end) in enumerate(
+                chunk_text(text, target_chars, overlap_chars) if "text" in kinds else []):
             body = text[start:end].strip()
             if not body:
                 continue
@@ -111,7 +115,7 @@ def rows_for_document(document, target_chars, overlap_chars):
                 "asset_ids": inside, "char_start": start, "char_end": end,
             })
 
-        for asset_id, record in section["images"].items():
+        for asset_id, record in (section["images"].items() if "figure" in kinds else ()):
             description = record.get("description") or ""
             if not description:
                 continue          # UNREADABLE or not yet enriched — nothing to embed
@@ -125,7 +129,7 @@ def rows_for_document(document, target_chars, overlap_chars):
                 "char_offset": record.get("char_offset"),
             })
 
-        for asset_id, record in section["tables"].items():
+        for asset_id, record in (section["tables"].items() if "table" in kinds else ()):
             rows.append({
                 "kind": "table", "doc_id": doc_id, "section_id": section["section_id"],
                 "ord": asset_id, "heading": heading, "title": title,
@@ -203,11 +207,12 @@ def to_sparse(weights):
 # --------------------------------------------------------------------------- #
 
 class Populator:
-    def __init__(self, collection=QDRANT_COLLECTION, batch_size=EMBED_BATCH_SIZE):
+    def __init__(self, collection=QDRANT_COLLECTION, batch_size=EMBED_BATCH_SIZE,
+                 state_path=None):
         self.collection = collection
         self.batch_size = batch_size
         self.docs_dir = os.path.join(LOCAL_PROCESSED_DIR, PROCESSED_DOCS_DIR_NAME)
-        self.state_path = os.path.join(LOCAL_PROCESSED_DIR, INDEXED_DOCS_JSON)
+        self.state_path = state_path or os.path.join(LOCAL_PROCESSED_DIR, INDEXED_DOCS_JSON)
         self._model = None
 
     @property
@@ -219,15 +224,24 @@ class Populator:
         return self._model
 
     def _indexed(self):
+        """{doc_id: {kinds already in the collection}}.
+
+        A flat list is the older format, written before --kinds existed; it can
+        only have come from a run that indexed everything.
+        """
         try:
             with open(self.state_path) as handle:
-                return set(json.load(handle))
+                data = json.load(handle)
         except (FileNotFoundError, json.JSONDecodeError):
-            return set()
+            return {}
+        if isinstance(data, list):
+            return {doc_id: set(ROW_KINDS) for doc_id in data}
+        return {doc_id: set(kinds) for doc_id, kinds in data.items()}
 
     def _record(self, indexed):
+        payload = {doc_id: sorted(kinds) for doc_id, kinds in sorted(indexed.items())}
         with open(self.state_path + ".part", "w") as handle:
-            json.dump(sorted(indexed), handle)
+            json.dump(payload, handle)
         os.replace(self.state_path + ".part", self.state_path)
 
     def encode(self, texts):
@@ -237,21 +251,24 @@ class Populator:
         return out["dense_vecs"], out["lexical_weights"]
 
     def run(self, limit=None, force=False, recreate=False,
-            chunk_tokens=CHUNK_TOKENS, overlap_tokens=CHUNK_OVERLAP_TOKENS):
+            chunk_tokens=CHUNK_TOKENS, overlap_tokens=CHUNK_OVERLAP_TOKENS,
+            kinds=ROW_KINDS):
         from qdrant_client import models
 
         client, where = connect()
         ensure_collection(client, self.collection, recreate)
         print(f"qdrant: {where} | collection: {self.collection}")
 
-        indexed = set() if (force or recreate) else self._indexed()
+        wanted = set(kinds)
+        indexed = {} if (force or recreate) else self._indexed()
         paths = sorted(glob.glob(os.path.join(self.docs_dir, "*.json")))
-        pending = [p for p in paths
-                   if force or recreate or os.path.basename(p)[:-5] not in indexed]
+        pending = [p for p in paths if force or recreate
+                   or wanted - indexed.get(os.path.basename(p)[:-5], set())]
         done = len(paths) - len(pending)
         if limit:
             pending = pending[:limit]
-        print(f"{len(paths)} documents | {done} already indexed | {len(pending)} to do")
+        print(f"kinds: {', '.join(sorted(wanted))}")
+        print(f"{len(paths)} documents | {done} already have them | {len(pending)} to do")
         if not pending:
             return
 
@@ -259,26 +276,37 @@ class Populator:
         overlap = overlap_tokens * CHARS_PER_TOKEN
         counts, buffer = {"text": 0, "figure": 0, "table": 0}, []
 
+        # Documents are marked done only after their rows reach Qdrant: marking
+        # earlier would let a kill lose buffered rows a resume then skips.
+        staged = []
         for path in tqdm(pending, desc="Indexing"):
             document = json.load(open(path))
-            rows = rows_for_document(document, target, overlap)
+            rows = rows_for_document(document, target, overlap, wanted)
             for row in rows:
                 counts[row["kind"]] += 1
             buffer.extend(rows)
+            staged.append(document["id"])
 
             if len(buffer) >= UPSERT_BATCH_SIZE:
                 self._flush(client, buffer, models)
                 buffer = []
-            indexed.add(document["id"])
-            self._record(indexed)
+                for doc_id in staged:
+                    indexed[doc_id] = indexed.get(doc_id, set()) | wanted
+                self._record(indexed)
+                staged = []
 
         if buffer:
             self._flush(client, buffer, models)
+        if staged:
+            for doc_id in staged:
+                indexed[doc_id] = indexed.get(doc_id, set()) | wanted
+            self._record(indexed)
 
         total = client.count(self.collection).count
         print(f"\nrows added: {counts['text']:,} text | {counts['figure']:,} figure | "
               f"{counts['table']:,} table")
         print(f"collection now holds {total:,} points")
+        client.close()
 
     def _flush(self, client, rows, models):
         dense, sparse = self.encode([embed_input(row) for row in rows])
@@ -313,6 +341,7 @@ class Populator:
             query=models.FusionQuery(fusion=models.Fusion.RRF),
             query_filter=query_filter, limit=k, with_payload=True,
         )
+        client.close()
         return result.points
 
 
@@ -324,6 +353,10 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-tokens", type=int, default=CHUNK_TOKENS)
     parser.add_argument("--overlap-tokens", type=int, default=CHUNK_OVERLAP_TOKENS)
     parser.add_argument("--collection", default=QDRANT_COLLECTION)
+    parser.add_argument("--kinds", nargs="+", choices=list(ROW_KINDS), default=list(ROW_KINDS),
+                        help="index only these row kinds — e.g. `--kinds figure` after "
+                             "enrichment adds descriptions, which leaves existing text and "
+                             "table points untouched")
     parser.add_argument("--search", metavar="QUERY", help="run a hybrid search and exit")
     parser.add_argument("--kind", choices=["text", "figure", "table"],
                         help="restrict --search to one row kind")
@@ -338,4 +371,4 @@ if __name__ == "__main__":
             print(f"   {payload['text'][:200].replace(chr(10), ' ')}")
     else:
         populator.run(args.limit, args.force, args.recreate,
-                      args.chunk_tokens, args.overlap_tokens)
+                      args.chunk_tokens, args.overlap_tokens, args.kinds)
