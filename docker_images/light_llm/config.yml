@@ -1,0 +1,42 @@
+# Models the gateway serves. Application code names an alias ("vision", "chat");
+# which provider answers is decided here, so swapping one is a config change and
+# a container restart — no code edit, no redeploy.
+#
+# api_key values are resolved from the container's environment at call time; the
+# compose file passes them through from POC/.env.
+model_list:
+  # Figure description during document parsing (Ingestion/data_process.py).
+  # Bulk, vision, cost-sensitive: ~10k calls over the corpus.
+  - model_name: vision
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  # Answer generation at query time. Low volume, quality-sensitive.
+  - model_name: chat
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  # Fallback for either alias when Gemini is rate-limiting or down.
+  - model_name: chat-fallback
+    litellm_params:
+      model: openai/gpt-4.1-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+litellm_settings:
+  cache: true
+  cache_params:
+    type: redis
+    host: redis
+    port: 6379
+  # Identical figure sent twice costs once. Descriptions are temperature 0, so
+  # a cache hit is the same answer the model would have given.
+  fallbacks: [{"vision": ["chat-fallback"]}, {"chat": ["chat-fallback"]}]
+
+router_settings:
+  redis_host: redis
+  redis_port: 6379
+
+general_settings:
+  disable_no_redis_warning: false
