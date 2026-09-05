@@ -121,6 +121,36 @@ def in_flight_ids():
     return ids
 
 
+def iter_figures():
+    """Every figure in the parsed corpus, with the context its prompt needs."""
+    for path in sorted(glob.glob(os.path.join(PROCESSED_DIR, "docs", "*.json"))):
+        document = json.load(open(path))
+        doc_id = document["id"]
+        for section in document["sections"]:
+            for image_id, record in section["images"].items():
+                image_path = os.path.join(PROCESSED_DIR, "images", record["path"])
+                if not os.path.exists(image_path):
+                    continue
+                yield {
+                    "custom_id": custom_id(doc_id, image_id),
+                    "doc_id": doc_id, "image_id": image_id, "image_path": image_path,
+                    "image_sha256": _image_digest(image_path),
+                    "caption": record.get("caption"), "title": document.get("title"),
+                    "heading": section.get("heading"),
+                }
+
+
+def figure_index():
+    """custom_id -> figure, unfiltered.
+
+    collect() needs this rather than pending_figures(): the figures it is writing
+    back are, by definition, sitting in an uncollected batch, so a pending scan
+    excludes them and their image hash would be stored as null — which makes a
+    described figure look undescribed and get paid for twice.
+    """
+    return {figure["custom_id"]: figure for figure in iter_figures()}
+
+
 def pending_figures(limit=None, only_failed=False):
     """Figures with no current description, newest parse wins.
 
@@ -341,7 +371,7 @@ async def collect():
                 by_doc[doc_id][image_id] = content
                 written["ok"] += 1
 
-            index = {f["custom_id"]: f for f in pending_figures()}
+            index = figure_index()
             for doc_id, descriptions in by_doc.items():
                 stored = load_descriptions(doc_id)
                 for image_id, content in descriptions.items():
