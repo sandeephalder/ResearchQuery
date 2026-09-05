@@ -72,3 +72,21 @@ OCR_IMAGE_PAGE_COVERAGE = 0.60
 IMAGE_ID_TEMPLATE = "img-{n}" + IMAGE_EXTENSION
 TABLE_ID_TEMPLATE = "table-{n}"
 PLACEHOLDER_TEMPLATE = "![{id}]({id})"
+
+# --- Corpus mirror on the Hugging Face Hub (fetch_data.py) -------------------
+# The 6.8 GB of PDFs, extracted figures and parse output lives here rather than
+# in git. Everything except `descriptions/` is reproducible from ingestion.py
+# and data_process.py — the descriptions cost money, so they are the reason the
+# mirror exists at all.
+HF_CORPUS_REPO = "sandeep-halder/research-query-corpus"
+HF_TOKEN_ENV_VARS = ("HF_KEY", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+
+# Named subsets, so a laptop can pull the 508 KB it needs instead of 6.8 GB.
+CORPUS_PARTS = {
+    "descriptions": ["processed/pdf/descriptions/**"],
+    "docs":         ["processed/pdf/docs/**", "processed/pdf/layout/**"],
+    "processed":    ["processed/**"],
+    "dataset":      ["dataset/**"],
+    "raw":          ["raw_dataset/**"],
+    "all":          None,
+}
