@@ -48,6 +48,11 @@ BATCH_MAX_TOKENS = 400
 # so the byte cap binds long before the request count does.
 MAX_BATCH_BYTES = 180 * 1024 * 1024
 MAX_BATCH_REQUESTS = 40_000
+# The binding limit is neither of the above: OpenAI caps *enqueued* tokens per
+# model per organisation, counting queued and in-progress batches together.
+# Exceed it and the batch is rejected outright rather than queued.
+MAX_ENQUEUED_TOKENS = 1_800_000        # under the 2M cap, with room for rounding
+TOKENS_PER_REQUEST = 1_300             # measured 845 input + 400 max output + margin
 
 # Bump when the prompt changes so existing descriptions are recomputed.
 PROMPT_VERSION = hashlib.sha256(PARSE_SYSTEM_PROMPT.encode()).hexdigest()[:8]
@@ -94,6 +99,28 @@ def split_custom_id(value):
 # What still needs describing
 # --------------------------------------------------------------------------- #
 
+def in_flight_ids():
+    """custom_ids already sitting in a submitted-but-uncollected batch.
+
+    Whether a figure needs describing is judged from descriptions on disk, and a
+    batch writes none until it is collected — so without this, submitting again
+    while one is in flight re-sends the same figures and pays twice.
+    """
+    ids = set()
+    for path in sorted(glob.glob(os.path.join(BATCH_STATE_DIR, "*.json"))):
+        state = _read_json(path, {})
+        if state.get("collected"):
+            continue
+        requests_path = path[: -len(".json")] + ".jsonl"
+        if not os.path.exists(requests_path):
+            continue
+        with open(requests_path) as handle:
+            for line in handle:
+                if line.strip():
+                    ids.add(json.loads(line)["custom_id"])
+    return ids
+
+
 def pending_figures(limit=None, only_failed=False):
     """Figures with no current description, newest parse wins.
 
@@ -102,6 +129,7 @@ def pending_figures(limit=None, only_failed=False):
     costs everything, and a swapped model costs only what it changes.
     """
     failures = _read_json(FAILURES_PATH, {}) if only_failed else None
+    airborne = set() if only_failed else in_flight_ids()
     pending = []
 
     for path in sorted(glob.glob(os.path.join(PROCESSED_DIR, "docs", "*.json"))):
@@ -114,8 +142,11 @@ def pending_figures(limit=None, only_failed=False):
                 image_path = os.path.join(PROCESSED_DIR, "images", record["path"])
                 if not os.path.exists(image_path):
                     continue
-                if only_failed and custom_id(doc_id, image_id) not in failures:
+                cid = custom_id(doc_id, image_id)
+                if only_failed and cid not in failures:
                     continue
+                if cid in airborne:
+                    continue            # already queued in a batch awaiting collection
 
                 previous = stored.get(image_id)
                 digest = _image_digest(image_path)
@@ -151,8 +182,19 @@ def _image_digest(path):
 # Phases
 # --------------------------------------------------------------------------- #
 
-def build_chunks(figures):
-    """Group request lines into files under the provider's per-file limits."""
+def requests_per_batch():
+    """How many requests fit under the enqueued-token cap."""
+    return max(1, MAX_ENQUEUED_TOKENS // TOKENS_PER_REQUEST)
+
+
+def build_chunks(figures, per_batch=None):
+    """Group request lines into files that respect every limit that applies.
+
+    Three caps, and the token one is the tightest by a wide margin: at ~1,300
+    tokens per figure, 1,800,000 enqueued tokens is about 1,380 requests — long
+    before 180 MB or 40,000 requests would bite.
+    """
+    per_batch = per_batch or requests_per_batch()
     chunks, current, size = [], [], 0
     for figure in figures:
         messages = _parse_messages(encode_image(figure["image_path"]), figure["caption"],
@@ -160,7 +202,8 @@ def build_chunks(figures):
         line = request_line(figure["custom_id"], BATCH_MODEL, messages,
                             PARSE_TEMPERATURE, BATCH_MAX_TOKENS)
         encoded = len(line.encode()) + 1
-        if current and (size + encoded > MAX_BATCH_BYTES or len(current) >= MAX_BATCH_REQUESTS):
+        if current and (size + encoded > MAX_BATCH_BYTES
+                        or len(current) >= min(MAX_BATCH_REQUESTS, per_batch)):
             chunks.append(current)
             current, size = [], 0
         current.append(line)
@@ -170,7 +213,7 @@ def build_chunks(figures):
     return chunks
 
 
-async def submit(limit=None, only_failed=False, dry_run=False):
+async def submit(limit=None, only_failed=False, dry_run=False, max_batches=1):
     figures = pending_figures(limit, only_failed)
     if not figures:
         print("Nothing to describe — every figure already has a current description.")
@@ -181,11 +224,19 @@ async def submit(limit=None, only_failed=False, dry_run=False):
     print("encoding images ...", flush=True)
     chunks = build_chunks(figures)
     total_bytes = sum(len(line.encode()) for chunk in chunks for line in chunk)
-    print(f"{len(chunks)} batch file(s), {total_bytes/2**20:.0f} MB total")
+    print(f"{len(chunks)} batch file(s), {total_bytes/2**20:.0f} MB total, "
+          f"<= {requests_per_batch():,} requests each")
 
     if dry_run:
         print("dry run — nothing uploaded")
         return
+
+    # The enqueued-token cap counts queued *and* in-progress batches, so
+    # submitting every chunk at once fails all of them. One at a time by default.
+    if max_batches and len(chunks) > max_batches:
+        print(f"submitting the first {max_batches} of {len(chunks)}; "
+              f"run submit again after collect for the rest")
+        chunks = chunks[:max_batches]
 
     os.makedirs(BATCH_STATE_DIR, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -262,8 +313,12 @@ async def collect():
                 print(f"{state['name']}: {batch.get('status')} — not ready")
                 continue
             if not batch.get("output_file_id"):
-                print(f"{state['name']}: {batch.get('status')} with no output file")
-                state.update(status=batch.get("status"), collected=True)
+                errors = (batch.get("errors") or {}).get("data") or []
+                reason = errors[0].get("message", "")[:120] if errors else "no output file"
+                print(f"{state['name']}: {batch.get('status')} — {reason}")
+                # Nothing was processed, so those figures stay pending and a later
+                # submit picks them up again.
+                state.update(status=batch.get("status"), collected=True, error=reason)
                 _write_atomic(path, state)
                 continue
 
@@ -347,10 +402,14 @@ if __name__ == "__main__":
                         help="re-queue only the ids in failed_descriptions.json")
     parser.add_argument("--dry-run", action="store_true",
                         help="build the batch files and report size, upload nothing")
+    parser.add_argument("--max-batches", type=int, default=1,
+                        help="batches to submit in one go (default 1; the enqueued-token "
+                             "cap counts in-flight batches, so more will be rejected)")
     args = parser.parse_args()
 
     if args.phase == "submit":
-        asyncio.run(submit(args.limit, args.retry_failed, args.dry_run))
+        asyncio.run(submit(args.limit, args.retry_failed, args.dry_run,
+                           args.max_batches))
     elif args.phase == "status":
         asyncio.run(status())
     elif args.phase == "collect":
