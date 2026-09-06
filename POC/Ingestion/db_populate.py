@@ -130,21 +130,72 @@ def rows_for_document(document, target_chars, overlap_chars, kinds=ROW_KINDS):
             })
 
         for asset_id, record in (section["tables"].items() if "table" in kinds else ()):
-            rows.append({
-                "kind": "table", "doc_id": doc_id, "section_id": section["section_id"],
-                "ord": asset_id, "heading": heading, "title": title,
-                "pages": [record["page"]], "page": record["page"],
-                "text": _join(record.get("caption"), record.get("markdown")),
-                "asset_id": asset_id, "rows": record.get("rows"),
-                "cols": record.get("cols"), "caption": record.get("caption"),
-                "char_offset": record.get("char_offset"),
-            })
+            caption = record.get("caption")
+            # What survives embed_input's ceiling, less the heading and caption
+            # it prepends — so a part is sized to what the model will actually read.
+            budget = (MAX_ROW_TOKENS * CHARS_PER_TOKEN
+                      - len(heading) - len(caption or "") - 4)
+            chunks = split_table(record.get("markdown") or "", max(budget, 1))
+            for part, chunk in enumerate(chunks):
+                rows.append({
+                    "kind": "table", "doc_id": doc_id, "section_id": section["section_id"],
+                    # Part 0 keeps the bare asset id, so re-indexing a table that
+                    # used to be one row overwrites it instead of orphaning it.
+                    "ord": asset_id if part == 0 else f"{asset_id}#{part}",
+                    "heading": heading, "title": title,
+                    "pages": [record["page"]], "page": record["page"],
+                    "text": _join(caption, chunk),
+                    "asset_id": asset_id, "rows": record.get("rows"),
+                    "cols": record.get("cols"), "caption": caption,
+                    "char_offset": record.get("char_offset"),
+                    "part": part, "parts": len(chunks),
+                })
     return rows
 
 
 def _join(caption, body):
     """Caption first: it carries the authors' own words, which queries echo."""
     return "\n\n".join(part for part in (caption, body) if part)
+
+
+def split_table(markdown, budget):
+    """A table's markdown as one or more chunks, each repeating the header.
+
+    28 tables in the corpus exceed what one row can hold, and truncating them
+    discarded 365k characters — whole result sets that the paper's own numbers
+    live in. Splitting is by whole rows, because half a row is not a fact, and
+    every part carries the header row and its separator: a chunk that does not
+    say what its columns are cannot be read on its own, which is the only reason
+    to retrieve it.
+
+    A single row wider than the budget is truncated. Two rows in the corpus are
+    (the widest is 11,188 characters); fixing those needs a column-wise split,
+    which is a different and rarer problem.
+    """
+    if len(markdown) <= budget:
+        return [markdown]
+
+    lines = markdown.splitlines()
+    # `|---|---|` closes the header of a markdown table. Anything above it is
+    # header and travels with every part.
+    rule = next((index for index, line in enumerate(lines[:4])
+                 if "-" in line and set(line.strip()) <= set("|-: ")), 0)
+    header, body = lines[:rule + 1], lines[rule + 1:]
+    room = budget - len("\n".join(header)) - 1
+    if room <= 0:
+        return [markdown[:budget]]        # the header alone overruns; nothing to split
+
+    parts, current, size = [], [], 0
+    for line in body:
+        line = line[:room]
+        if current and size + len(line) + 1 > room:
+            parts.append("\n".join(header + current))
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        parts.append("\n".join(header + current))
+    return parts or [markdown[:budget]]
 
 
 def embed_input(row):
@@ -217,10 +268,27 @@ class Populator:
 
     @property
     def model(self):
+        """The same `Embeddings` object the query side uses.
+
+        `retrieval.embeddings.BGEM3Embeddings` is a LangChain `Embeddings`
+        implementation over BGE-M3, and indexing borrows it rather than loading
+        its own copy of the model. That is not tidiness: the vectors written
+        here are the space every query lands in, and two implementations of
+        "BGE-M3" that pooled or normalised even slightly differently would be a
+        corpus-wide accuracy loss with no error to read.
+
+        Imported here rather than at the top of the file because
+        `retrieval.paths` imports *this* module — the query side reads rows
+        through `rows_for_document` — and a module-level import would close the
+        circle.
+        """
         if self._model is None:
-            from FlagEmbedding import BGEM3FlagModel
-            print(f"loading {EMBED_MODEL} ...", flush=True)
-            self._model = BGEM3FlagModel(EMBED_MODEL, use_fp16=True)
+            poc = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if poc not in sys.path:
+                sys.path.insert(0, poc)
+            from retrieval.embeddings import BGEM3Embeddings
+            self._model = BGEM3Embeddings(EMBED_MODEL, use_fp16=True,
+                                          batch_size=self.batch_size)
         return self._model
 
     def _indexed(self):
@@ -245,9 +313,8 @@ class Populator:
         os.replace(self.state_path + ".part", self.state_path)
 
     def encode(self, texts):
-        out = self.model.encode(texts, batch_size=self.batch_size,
-                                return_dense=True, return_sparse=True,
-                                return_colbert_vecs=False)
+        """(dense vectors, lexical weights) for a batch, from one forward pass."""
+        out = self.model.encode(texts)
         return out["dense_vecs"], out["lexical_weights"]
 
     def run(self, limit=None, force=False, recreate=False,

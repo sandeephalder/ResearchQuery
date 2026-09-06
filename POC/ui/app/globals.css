@@ -1,0 +1,122 @@
+/* One stylesheet, no framework. The UI is four components and a form; a utility
+   framework would be more configuration than markup. */
+
+:root {
+  --bg: #fbfbfa;
+  --panel: #ffffff;
+  --ink: #1a1a19;
+  --muted: #6b6b66;
+  --line: #e5e4e0;
+  --accent: #2f6f4f;
+  --accent-weak: #eef4f0;
+  --warn: #8a5a1a;
+  --warn-weak: #fdf3e3;
+  --error: #8f2f2f;
+  --error-weak: #fbeeee;
+  --radius: 10px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16161a;
+    --panel: #1e1e23;
+    --ink: #ececea;
+    --muted: #9a9a94;
+    --line: #33333a;
+    --accent: #7fc6a0;
+    --accent-weak: #1d2a23;
+    --warn: #e0b072;
+    --warn-weak: #2b2418;
+    --error: #e39a9a;
+    --error-weak: #2b1c1c;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+.shell { max-width: 900px; margin: 0 auto; padding: 0 24px 80px; }
+
+header.bar {
+  display: flex; align-items: center; gap: 16px;
+  padding: 18px 24px; border-bottom: 1px solid var(--line);
+  max-width: 900px; margin: 0 auto;
+}
+header.bar h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+header.bar .spacer { flex: 1; }
+
+.sub { color: var(--muted); font-size: 13px; margin: 20px 0 24px; }
+
+textarea {
+  width: 100%; min-height: 92px; padding: 12px 14px; resize: vertical;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel); color: var(--ink); font: inherit;
+}
+textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+.row { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+
+button {
+  padding: 9px 18px; border-radius: var(--radius); border: 1px solid transparent;
+  background: var(--accent); color: #fff; font: inherit; font-weight: 500; cursor: pointer;
+}
+button:disabled { opacity: 0.55; cursor: not-allowed; }
+button.ghost { background: transparent; color: var(--muted); border-color: var(--line); }
+
+label.toggle { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+
+.panel {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 18px 20px; margin-top: 20px;
+}
+.panel h2 {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.07em;
+  color: var(--muted); margin: 0 0 12px; font-weight: 600;
+}
+
+.answer { white-space: pre-wrap; }
+.answer .cite {
+  color: var(--accent); font-weight: 600; cursor: pointer;
+  border-bottom: 1px dotted var(--accent);
+}
+
+.note { border-radius: var(--radius); padding: 12px 14px; font-size: 14px; }
+.note.warn { background: var(--warn-weak); color: var(--warn); }
+.note.error { background: var(--error-weak); color: var(--error); }
+
+ol.citations { list-style: none; margin: 0; padding: 0; }
+ol.citations li { padding: 10px 0; border-top: 1px solid var(--line); }
+ol.citations li:first-child { border-top: none; }
+ol.citations li.target { background: var(--accent-weak); border-radius: 6px; padding-inline: 10px; }
+.cite-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.cite-n { font-family: var(--mono); color: var(--accent); font-weight: 600; }
+.cite-label { font-size: 14px; }
+.cite-score { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.cite-text { margin: 6px 0 0; font-size: 13px; color: var(--muted); }
+
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; font-size: 13px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; font-family: var(--mono); }
+
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  font-family: var(--mono); font-size: 12px; padding: 3px 8px;
+  border: 1px solid var(--line); border-radius: 999px; color: var(--muted);
+}
+
+.badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.dot.ok { background: var(--accent); }
+.dot.bad { background: var(--error); }
+
+.facts { margin: 0; padding-left: 18px; font-size: 13px; color: var(--muted); }
+.facts li { margin: 3px 0; }
+
+.center { text-align: center; padding: 60px 0; color: var(--muted); }

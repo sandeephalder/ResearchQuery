@@ -173,6 +173,159 @@ so raising it tends to produce more `429`s rather than a faster run.
 - The upstream dataset card notes Mistral OCR "struggles with unstructured PDFs" —
   parse quality in `corpus/` is uneven, which is why the raw PDFs are kept.
 
+## End-to-end evaluation
+
+Run on 2026-09-06 over the full evaluation split: **3,045 questions, 5.8 hours,
+$3.60**.
+
+> **This section records what was measured then, on the harness of the time.**
+> `evals/answer_eval.py` has since been rebuilt on [RAGAS](../evals/), which
+> reports five metrics on a 0-1 scale in place of the single 0-3 judge score
+> below. The commands still run, but the numbers they now print are **not
+> comparable to the ones in this section** — the columns are different measures,
+> not a rescaling of the same one. Read what follows as the baseline this
+> pipeline started from; re-running the sweep is what would restate it.
+
+```bash
+uv run python -m evals.answer_eval --limit 3045 --reranker cross-encoder \
+    --concurrency 8 --out runs/full_xenc.jsonl
+uv run python -m evals.answer_eval --report runs/full_xenc.jsonl
+```
+
+The run is resumable — every record is appended and flushed as it is scored, so
+re-running the same command continues from where the file stops.
+
+### What was measured, and what could not be
+
+Each question is scored on its own. The pipeline's answer is compared against
+the reference in `answers.json` by a judge model (gpt-4.1-mini) scoring 0-3 on
+how much of the reference's substance survived. The judge is instructed to
+ignore length and wording, and explicitly **not** to penalise correct detail the
+brief reference omits — otherwise it marks down the answers that used the
+retrieved passages best.
+
+**Section-level retrieval scoring is not reported, because it cannot be.** The
+gold `section_id` in `qrels.json` indexes *vectara's* parse of the PDF, not the
+one `data_process.py` produces. Measured over the 396 documents carrying gold
+labels, the gold id is out of range of our parse entirely in 23% of them, and
+the counts diverge in both directions (`2412.02582v2`: gold max 14, ours 143;
+`2406.17972v3`: gold max 48, ours 5). An early BM25-only run scored 97.2%
+doc-level recall@10 but 18.5% section-level — the gap is the numbering, not the
+retriever. Everything below is therefore **doc-level**.
+
+### The configuration it was measured against
+
+| | |
+| --- | --- |
+| collection | 80,363 points — 67,530 text, 9,458 figure, 3,375 table |
+| retrieval | 10 candidates from Qdrant (dense BGE-M3) + 10 from BM25, fused by RRF |
+| reranker | `BAAI/bge-reranker-v2-m3` on MPS, top 5 kept |
+| answer | gpt-4.1-mini, `INFER_SYSTEM_PROMPT`, cites passages as `[1]..[5]` |
+| judge | gpt-4.1-mini |
+
+### Headline
+
+| | |
+| --- | --- |
+| mean score (0-3) | **2.61** |
+| scored 2 or better | **93%** |
+| scored 3 (fully correct) | 72% |
+| abstained | 2% |
+| gold document among the candidates | **99.6%** |
+| gold document survived reranking | 99.2% |
+| judge failures (unscored) | 11 of 3,045 |
+
+```
+3  ████████████████████████████████████  2,195   72.3%
+2  ██████████                              624   20.6%
+1  █                                        98    3.2%
+0  █                                       117    3.9%
+```
+
+### Retrieval is not the bottleneck
+
+The median fused rank of the gold document is **1**, and it reaches the reranker
+99.6% of the time. Averaged over the corpus a question draws 15.8 unique
+candidates from the 10+10 fetch, so the two legs agree on roughly a quarter of
+what they return.
+
+That makes the failure taxonomy the useful table. Of the 215 questions scoring
+below 2:
+
+| cause | n | share of failures | share of all |
+| --- | --- | --- | --- |
+| answered wrong with the gold document in context | 149 | 69.3% | 4.9% |
+| abstained with the gold document in context | 49 | 22.8% | 1.6% |
+| gold document never retrieved | 10 | 4.7% | 0.3% |
+| gold document dropped by the reranker | 7 | 3.3% | 0.2% |
+
+**92% of failures happen after retrieval has already succeeded.** Tuning `k1`,
+`b`, the 10/10 split or the RRF constant would move the bottom two rows, which
+together account for 0.5% of the benchmark. The generation and grounding step is
+where the remaining quality is.
+
+### Modality is the real gap
+
+| source | n | score | ≥2 | =3 | abstained | gold@20 |
+| --- | --- | --- | --- | --- | --- | --- |
+| text | 1,906 | **2.73** | 96% | 79% | 1% | 100% |
+| text-image | 760 | **2.41** | 88% | 60% | 4% | 99% |
+| text-table | 148 | **2.41** | 86% | 62% | 3% | 100% |
+| text-table-image | 220 | **2.46** | 89% | 63% | 4% | 100% |
+
+Every multimodal slice trails text by ~0.3, and the gap is not retrieval —
+`gold@20` is 99-100% everywhere. It is concentrated in the *fully correct* rate,
+which falls from 79% to 60-63%, and in abstentions, which quadruple from 1% to
+4%. The figures and tables are being **found and not used**: the VLM description
+is enough to match the question but not always enough to answer it.
+
+That is the sharpest actionable finding here, and it is one section-level
+scoring could never have produced. The 9,458 figure descriptions average 741
+characters and are written to be *searchable* — `PARSE_SYSTEM_PROMPT` asks for
+2-4 factual sentences ordered as figure type, then axes, then the trend. For
+retrieval that ordering is right. For answering a question about a specific
+value it may not be, and the 4% abstention rate on image queries is the model
+saying so.
+
+### By question type
+
+| type | n | score | ≥2 |
+| --- | --- | --- | --- |
+| extractive | 1,245 | 2.72 | 92% |
+| abstractive | 1,789 | 2.54 | 94% |
+
+Extractive questions score higher on average but fail harder: they clear the
+bar less often while scoring 3 more often, which is what a question with one
+right answer looks like.
+
+### Cost and throughput
+
+| | |
+| --- | --- |
+| wall clock | 20,962s (5.8h), ~6.9s per question |
+| API cost | $3.60 (gpt-4.1-mini, answer + judge only) |
+| reranking | free — local cross-encoder, ~4s of the 6.9s |
+
+Reranking is the whole latency budget and none of the bill. With an LLM
+reranker instead it would be ~73% of the token cost — $10.81 rather than $3.60
+at standard pricing, or $5.41 batched.
+
+### Open questions this run does not answer
+
+- **Is the LLM reranker better?** Only the cross-encoder arm was run. The A/B is
+  `--reranker llm` against the same seed, and it is the one comparison that
+  would justify the extra $7.
+- **Would richer figure descriptions close the modality gap?** The evidence
+  points at description content, not retrieval, but re-enriching with an
+  answer-oriented prompt and re-running the `text-image` slice is what would
+  prove it.
+- **Nothing in the retrieval layer is tuned.** `k1`, `b`, the 10/10 split, the
+  RRF constant and `--vector-mode` are all defaults. Given 92% of failures are
+  post-retrieval, tuning them has a ceiling of about half a percent.
+- **11 questions went unjudged** on judge errors and are excluded from every
+  number above.
+
+
 ## Licence
 
 The dataset is CC-BY-NC-4.0. See `data/dataset/README.md` for the upstream card.

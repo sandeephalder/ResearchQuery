@@ -1,0 +1,48 @@
+# NeMo Guardrails — stage 1 (input) and stage 5 (output) of the agent flow.
+#
+# The models block is overridden at load time from `agents/constants.py`, so the
+# engine and model here are the documented defaults rather than the last word;
+# GUARDRAIL_ENGINE / GUARDRAIL_MODEL in the environment win. The file stays
+# checked in and readable because the rails themselves — which flows run, in
+# which order — are the part worth reviewing.
+
+models:
+  # `engine: openai` is the OpenAI *dialect*, not the vendor — the base_url and
+  # api_key in agents/constants.py decide who actually serves it. Both entries
+  # here are overridden at load time; what the file is for is the rails.
+  - type: main
+    engine: openai
+    model: llama3.1:8b
+
+  - type: llama_guard
+    engine: openai
+    model: llama-guard3:1b
+    parameters:
+      base_url: http://192.168.1.12:11434/v1
+      api_key: ollama
+
+rails:
+  input:
+    flows:
+      # Both flows are managed by guardrail.py, which inserts "llama guard
+      # check input" first and removes "self check input" unless
+      # GUARDRAIL_SELF_CHECK is set. The self-check needs a model that answers
+      # Yes or No immediately, and the local and free ones all reason first —
+      # which that rail reads as a block. Left listed here so the config still
+      # documents what the second gate would be.
+      - self check input
+
+  output:
+    flows:
+      # Defined in flows.co, backed by the `verify_answer` action registered
+      # in guardrail.py. Not the built-in `self check output`, whose action can
+      # only answer yes or no — a repair loop needs to know what was wrong.
+      - check answer grounding
+
+  dialog:
+    # Nothing here generates. The pipeline retrieves and answers; NeMo is asked
+    # only for the two rails, via GenerationOptions(rails=["input"]) and
+    # (rails=["output"]). A dialog rail would put a second, ungrounded answer
+    # in the flow.
+    single_call:
+      enabled: False

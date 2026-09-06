@@ -1,0 +1,37 @@
+```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	guardrail_in(guardrail_in)
+	router(router)
+	retrieve(retrieve)
+	rerank(rerank)
+	extract(extract)
+	generate(generate)
+	verify(verify)
+	repair(repair)
+	refuse(refuse)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> guardrail_in;
+	extract --> generate;
+	generate --> verify;
+	guardrail_in -.-> refuse;
+	guardrail_in -.-> router;
+	repair --> verify;
+	rerank -.-> __end__;
+	rerank -.-> extract;
+	rerank -.-> refuse;
+	retrieve -.-> refuse;
+	retrieve -.-> rerank;
+	router --> retrieve;
+	verify -.-> __end__;
+	verify -.-> repair;
+	refuse --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+```
