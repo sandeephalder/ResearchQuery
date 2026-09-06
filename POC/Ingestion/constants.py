@@ -101,8 +101,9 @@ EMBED_DIM = 1024
 DENSE_VECTOR = "dense"
 SPARSE_VECTOR = "sparse"
 
-# Chunking. 2048 tokens covers 99.2% of table rows whole (see retrieval_eval.ipynb),
-# so only text sections are split; asset rows are indexed as they are.
+# Chunking. 2048 tokens covers 99.2% of table rows whole (see retrieval_eval.ipynb).
+# The other 0.8% — 28 tables, 365k characters — are split by row groups rather than
+# truncated, each part repeating the header (see db_populate.split_table).
 CHUNK_TOKENS = 500
 CHUNK_OVERLAP_TOKENS = 75
 CHARS_PER_TOKEN = 4                     # consistent with the sizing in the notebooks

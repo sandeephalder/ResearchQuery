@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+#
+# Run the API and the UI together.
+#
+#   ./run_app.sh              # both, and stop both on Ctrl+C
+#   ./run_app.sh api          # the FastAPI backend only
+#   ./run_app.sh ui           # the Next.js UI only
+#   ./run_app.sh status       # what is up, and what the corpus looks like
+#   ./run_app.sh stop         # stop whatever this script left running
+#
+# API_PORT (8000) and UI_PORT (3000) override the ports. Changing API_PORT means
+# changing NEXT_PUBLIC_API_URL too; changing UI_PORT means adding the new origin
+# to the backend's CORS_ORIGINS, or every call from the browser is blocked.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UI_DIR="$SCRIPT_DIR/ui"
+LOG_DIR="$SCRIPT_DIR/logs"
+ENV_FILE="$SCRIPT_DIR/.env"
+
+API_PORT="${API_PORT:-8000}"
+UI_PORT="${UI_PORT:-3000}"
+API_LOG="$LOG_DIR/api.log"
+UI_LOG="$LOG_DIR/ui.log"
+
+# Loading BGE-M3, the cross-encoder and the NeMo rails, then opening the
+# embedded Qdrant store. Measured at 40-60s cold; three minutes is a failure,
+# not a slow machine.
+API_READY_TIMEOUT="${API_READY_TIMEOUT:-180}"
+UI_READY_TIMEOUT="${UI_READY_TIMEOUT:-90}"
+
+API_PID=""
+UI_PID=""
+
+usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+say()  { printf '\033[1m%s\033[0m\n' "$*"; }
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --------------------------------------------------------------------------- #
+# Preflight
+# --------------------------------------------------------------------------- #
+
+if command -v uv >/dev/null 2>&1; then
+    RUN=(uv run --project "$SCRIPT_DIR")
+elif [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
+    RUN=("$SCRIPT_DIR/.venv/bin/python" -m)
+else
+    die $'neither uv nor .venv/bin/python is available\nhint: install uv, or create the venv with '"'"'uv sync'"'"''
+fi
+
+# `lsof -ti` prints one pid per matching socket, and a server listening on both
+# IPv4 and IPv6 matches twice. `head -1` takes one; the `|| true` keeps a
+# no-match (which exits non-zero) from tripping `set -e` inside a substitution.
+port_owner() { { lsof -ti "tcp:$1" -sTCP:LISTEN 2>/dev/null || true; } | head -1; }
+
+env_value() {
+    # Everything after the first '=' on the first matching line. Handles values
+    # containing '=' — a JWT key is full of them.
+    [[ -f "$ENV_FILE" ]] || return 0
+    sed -n "s/^$1=//p" "$ENV_FILE" | head -1
+}
+
+check_api_prereqs() {
+    [[ -f "$ENV_FILE" ]] || die "no $ENV_FILE — the API reads its keys from there"
+    [[ -n "$(env_value CLERK_SECRET_KEY)" ]] || die \
+        $'CLERK_SECRET_KEY is not set in POC/.env\nthe API refuses to start without it, and there is deliberately no dev bypass'
+
+    # The BM25 leg is loaded at construction, so a missing index fails the whole
+    # startup rather than the first lexical query.
+    local bm25="$SCRIPT_DIR/Ingestion/data/processed/pdf/bm25/bm25.pkl"
+    [[ -f "$bm25" ]] || warn \
+        $'no BM25 index; the API will fail to start\n           build it (~6s): uv run python -m retrieval.bm25 --build'
+
+    # Embedded Qdrant admits one process — not one writer and many readers. A
+    # notebook kernel holding it open is the usual culprit, and the failure it
+    # produces names a lock rather than a cause.
+    local owner
+    owner="$(port_owner "$API_PORT")"
+    if [[ -n "$owner" ]]; then
+        die "port $API_PORT is already in use by pid $owner
+       that process may also hold the Qdrant lock, so starting a second API
+       would fail anyway — stop it first, or:  ./run_app.sh stop"
+    fi
+}
+
+check_ui_prereqs() {
+    command -v npm >/dev/null 2>&1 || die \
+        $'npm is not installed, and the UI needs it\nhint: install Node, or run just the API with:  ./run_app.sh api'
+    [[ -d "$UI_DIR" ]] || die "no $UI_DIR"
+
+    local owner
+    owner="$(port_owner "$UI_PORT")"
+    [[ -z "$owner" ]] || die "port $UI_PORT is already in use by pid $owner — ./run_app.sh stop"
+
+    if [[ ! -d "$UI_DIR/node_modules" ]]; then
+        say "installing UI dependencies (once, ~40s) ..."
+        (cd "$UI_DIR" && npm install --no-audit --no-fund)
+    fi
+    write_ui_env
+}
+
+write_ui_env() {
+    # Regenerated from POC/.env every run, so the two cannot drift — the UI and
+    # the API must present the same Clerk instance or every token is rejected.
+    #
+    # CLERK_SECRET_KEY is required here and not only in the API: clerkMiddleware
+    # runs on the Next server and verifies sessions with it. Without it every
+    # route 500s with "Missing secretKey", and the publishable key alone is not
+    # enough. It has no NEXT_PUBLIC_ prefix, so it stays server-side.
+    local publishable secret target="$UI_DIR/.env.local"
+    publishable="$(env_value NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY)"
+    secret="$(env_value CLERK_SECRET_KEY)"
+
+    [[ -n "$publishable" ]] || warn \
+        "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY is not in POC/.env — sign-in will not load"
+
+    cat > "$target" <<ENV
+# Generated by run_app.sh from POC/.env. Gitignored; do not edit by hand.
+NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=$publishable
+CLERK_SECRET_KEY=$secret
+NEXT_PUBLIC_API_URL=http://localhost:$API_PORT
+ENV
+}
+
+# --------------------------------------------------------------------------- #
+# Starting and stopping
+# --------------------------------------------------------------------------- #
+
+cleanup() {
+    local code=$? owner
+    trap - EXIT INT TERM
+    [[ -z "$UI_PID" ]]  || kill "$UI_PID"  2>/dev/null || true
+    [[ -z "$API_PID" ]] || kill "$API_PID" 2>/dev/null || true
+    # `npm run dev` and `uv run` both exec a child that outlives the parent
+    # they were signalled through, and a survivor holds the port against the
+    # next run. Killing the pid we know about is not enough — so whatever is
+    # still listening is what actually gets stopped.
+    for port in "$UI_PORT" "$API_PORT"; do
+        owner="$(port_owner "$port")"
+        [[ -z "$owner" ]] || kill "$owner" 2>/dev/null || true
+    done
+    [[ -z "$UI_PID$API_PID" ]] || say "stopped."
+    exit "$code"
+}
+
+start_api() {
+    check_api_prereqs
+    mkdir -p "$LOG_DIR"
+    say "starting API on :$API_PORT  (log: ${API_LOG#"$SCRIPT_DIR"/})"
+    (cd "$SCRIPT_DIR" && "${RUN[@]}" uvicorn backend.main:app --port "$API_PORT") \
+        > "$API_LOG" 2>&1 &
+    API_PID=$!
+    wait_for_api
+}
+
+wait_for_api() {
+    local waited=0
+    printf 'loading models and opening the corpus '
+    until curl -sf "http://localhost:$API_PORT/health" 2>/dev/null \
+            | grep -q '"status":"ok"'; do
+        if ! kill -0 "$API_PID" 2>/dev/null; then
+            echo
+            tail -20 "$API_LOG" >&2
+            die "the API exited during startup — see $API_LOG"
+        fi
+        (( waited >= API_READY_TIMEOUT )) && { echo; die \
+            "the API did not become ready in ${API_READY_TIMEOUT}s — see $API_LOG"; }
+        printf '.'
+        sleep 2
+        waited=$(( waited + 2 ))
+    done
+    echo " ready in ${waited}s"
+    report_health
+}
+
+start_ui() {
+    check_ui_prereqs
+    mkdir -p "$LOG_DIR"
+    say "starting UI on :$UI_PORT   (log: ${UI_LOG#"$SCRIPT_DIR"/})"
+    (cd "$UI_DIR" && PORT="$UI_PORT" npm run dev) > "$UI_LOG" 2>&1 &
+    UI_PID=$!
+
+    local waited=0
+    until curl -sf -o /dev/null "http://localhost:$UI_PORT" 2>/dev/null; do
+        if ! kill -0 "$UI_PID" 2>/dev/null; then
+            tail -20 "$UI_LOG" >&2
+            die "the UI exited during startup — see $UI_LOG"
+        fi
+        (( waited >= UI_READY_TIMEOUT )) && die \
+            "the UI did not become ready in ${UI_READY_TIMEOUT}s — see $UI_LOG"
+        sleep 2
+        waited=$(( waited + 2 ))
+    done
+}
+
+report_health() {
+    # The JSON travels in an environment variable, not on stdin, because stdin
+    # is already the heredoc carrying the script. Piping curl in *and* using a
+    # heredoc means the heredoc wins, python reads an empty stdin, and the
+    # report silently prints nothing — which is how the first version failed.
+    local body
+    body="$(curl -sf "http://localhost:$API_PORT/health" 2>/dev/null || true)"
+    [[ -n "$body" ]] || return 0
+
+    HEALTH_JSON="$body" "${RUN[@]}" python - <<'PY' 2>/dev/null || true
+import json, os, sys
+
+try:
+    health = json.loads(os.environ["HEALTH_JSON"])
+except Exception:
+    sys.exit(0)
+
+points = health.get("corpus_points")
+rows = health.get("bm25_rows")
+rails = health.get("guardrail_flows") or []
+
+print("  corpus     {:,} points".format(points) if points else "  corpus     unknown")
+print("  bm25       {:,} rows".format(rows) if rows else "  bm25       not loaded")
+print("  reranker   {}".format(health.get("reranker")))
+print("  provider   {}".format(health.get("agent_provider")))
+print("  guardrail  {}".format(", ".join(rails) if rails else "off"))
+PY
+}
+
+
+stop_all() {
+    local stopped=0 owner
+    for port in "$API_PORT" "$UI_PORT"; do
+        owner="$(port_owner "$port")"
+        if [[ -n "$owner" ]]; then
+            kill "$owner" 2>/dev/null && { say "stopped pid $owner on :$port"; stopped=1; }
+        fi
+    done
+    (( stopped )) || say "nothing was running on :$API_PORT or :$UI_PORT"
+}
+
+show_status() {
+    local owner
+    for name_port in "API:$API_PORT" "UI:$UI_PORT"; do
+        owner="$(port_owner "${name_port#*:}")"
+        # Not `${owner:+a}${owner:-b}`: when `owner` is set, `:-` returns the
+        # value rather than the alternative, so both halves expand and the line
+        # reads "running, pid 68991" followed by "68991".
+        if [[ -n "$owner" ]]; then
+            printf '%-4s :%-5s running, pid %s\n' "${name_port%%:*}" "${name_port#*:}" "$owner"
+        else
+            printf '%-4s :%-5s not running\n' "${name_port%%:*}" "${name_port#*:}"
+        fi
+    done
+    if curl -sf "http://localhost:$API_PORT/health" >/dev/null 2>&1; then
+        report_health
+    fi
+}
+
+# --------------------------------------------------------------------------- #
+
+case "${1:-both}" in
+    -h|--help|help) usage ;;
+    stop)   stop_all; exit 0 ;;
+    status) show_status; exit 0 ;;
+    api)
+        trap cleanup EXIT INT TERM
+        start_api
+        say "API on http://localhost:$API_PORT   (docs at /docs)"
+        wait "$API_PID"
+        ;;
+    ui)
+        trap cleanup EXIT INT TERM
+        curl -sf "http://localhost:$API_PORT/health" >/dev/null 2>&1 || warn \
+            "the API is not running on :$API_PORT — the UI will load, but every question will fail"
+        start_ui
+        say "UI on http://localhost:$UI_PORT"
+        wait "$UI_PID"
+        ;;
+    both)
+        trap cleanup EXIT INT TERM
+        start_api
+        start_ui
+        echo
+        say "UI   http://localhost:$UI_PORT"
+        say "API  http://localhost:$API_PORT  (docs at /docs)"
+        echo
+        echo "Ctrl+C stops both."
+        # Whichever exits first brings the other down through the trap, so a
+        # crashed API does not leave a UI serving failed requests.
+        #
+        # Polled rather than `wait -n`, which is bash 4.3+ and this script has
+        # to run on macOS's bash 3.2. `wait -n` there is not a no-op: it fails
+        # with "invalid option", which under `set -e` tore the script down
+        # immediately after reporting both servers as up, leaving two orphans
+        # holding the ports.
+        while kill -0 "$API_PID" 2>/dev/null && kill -0 "$UI_PID" 2>/dev/null; do
+            sleep 1
+        done
+        ;;
+    *) usage 1 ;;
+esac

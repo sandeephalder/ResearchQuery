@@ -19,3 +19,7 @@ Ingestion/data/
 
 # Embedded Qdrant lives under Ingestion/data/, already ignored — noted here
 # because the collection is rebuildable from db_populate.py.
+
+# MLflow tracing — the local sqlite backend `tracing.py` defaults to
+mlflow.db
+mlruns/

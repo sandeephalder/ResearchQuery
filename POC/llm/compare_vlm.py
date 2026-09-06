@@ -23,8 +23,9 @@ import os
 import random
 import time
 
-from .client import LLMClient
+from .chains import describe_figure_chain
 from .constants import PROVIDERS
+from .images import encode_image
 
 PROCESSED_DIR = os.getenv("PROCESSED_DIR", "Ingestion/data/processed/pdf")
 
@@ -56,19 +57,25 @@ def endpoint(spec):
 
 
 async def describe_all(spec, figures):
+    """One chain per endpoint, reused across the sample.
+
+    Built once rather than per figure: the point of the comparison is the
+    model's time, and rebuilding a client for each call would put connection
+    setup inside the measurement.
+    """
     provider, model = endpoint(spec)
+    chain = describe_figure_chain(provider, model)
     results = []
-    async with LLMClient(provider) as client:
-        for figure in figures:
-            start = time.perf_counter()
-            try:
-                text = await client.parse(figure["image"], caption=figure["caption"],
-                                          title=figure["title"], heading=figure["heading"],
-                                          model=model)
-            except Exception as error:
-                text = f"<FAILED: {type(error).__name__}: {str(error)[:160]}>"
-            results.append({"model": spec, "seconds": time.perf_counter() - start,
-                            "description": text})
+    for figure in figures:
+        start = time.perf_counter()
+        try:
+            text = await chain.ainvoke({"image_uri": encode_image(figure["image"]),
+                                        "caption": figure["caption"], "title": figure["title"],
+                                        "heading": figure["heading"], "context": None})
+        except Exception as error:
+            text = f"<FAILED: {type(error).__name__}: {str(error)[:160]}>"
+        results.append({"model": spec, "seconds": time.perf_counter() - start,
+                        "description": text})
     return results
 
 

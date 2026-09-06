@@ -34,7 +34,9 @@ import os
 import time
 
 from .batch import BatchAPI, DONE_STATES, parse_result_line, request_line
-from .client import LLMClient, LLMError, _parse_messages, encode_image
+from .chains import parse_messages
+from .images import encode_image
+from .models import LLMError
 from .constants import PARSE_SYSTEM_PROMPT, PARSE_TEMPERATURE
 
 PROCESSED_DIR = os.getenv("PROCESSED_DIR", "Ingestion/data/processed/pdf")
@@ -227,7 +229,7 @@ def build_chunks(figures, per_batch=None):
     per_batch = per_batch or requests_per_batch()
     chunks, current, size = [], [], 0
     for figure in figures:
-        messages = _parse_messages(encode_image(figure["image_path"]), figure["caption"],
+        messages = parse_messages(encode_image(figure["image_path"]), figure["caption"],
                                    figure["title"], figure["heading"])
         line = request_line(figure["custom_id"], BATCH_MODEL, messages,
                             PARSE_TEMPERATURE, BATCH_MAX_TOKENS)

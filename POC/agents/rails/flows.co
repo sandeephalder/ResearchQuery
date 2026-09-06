@@ -1,0 +1,27 @@
+# The output rail.
+#
+# Not the built-in `self check output`: that flow's action returns a yes/no, and
+# a repair loop needs to know what was wrong. `verify_answer` is registered in
+# guardrail.py and runs `verifier.Verifier`, which returns the problems it found
+# alongside the decision. NeMo still owns the rail — when to run it, and what
+# happens when it blocks.
+
+# Overrides the message NeMo's own library defines. The stock text is
+# "I'm sorry, I can't respond to that.", which tells a user nothing about what
+# this system is for; a refusal is the only thing some users will ever see it
+# say, so it may as well point them somewhere useful.
+define bot refuse to respond
+  "I can't help with that one. This assistant answers questions about the indexed arXiv papers — try asking about a method, a result or a figure in the literature."
+
+define bot refuse to answer
+  "The drafted answer did not survive checking against the retrieved passages."
+
+define flow check answer grounding
+  $result = execute verify_answer
+  # Carried back to the caller through GenerationOptions(output_vars=...), which
+  # is how the repair loop learns what to fix. The rail itself only decides.
+  $verify_problems = $result.problems
+
+  if $result.is_blocked
+    bot refuse to answer
+    stop
